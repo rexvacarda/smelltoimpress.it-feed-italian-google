@@ -1,210 +1,283 @@
+import "dotenv/config";
 import express from "express";
+import { create } from "xmlbuilder2";
 
 const app = express();
 
 const {
   PORT = 3000,
 
-  // Shopify Storefront API
-  SHOPIFY_STORE_DOMAIN,           // e.g. "smelltoimpress.myshopify.com"
-  SHOPIFY_STOREFRONT_TOKEN,       // Storefront API access token
+  // Shopify (same style as your Zbozi/Glami guide)
+  SHOP_MYSHOPIFY_DOMAIN,     // e.g. "smelltoimpress.myshopify.com"
+  SHOPIFY_CLIENT_ID,
+  SHOPIFY_CLIENT_SECRET,
 
-  // Italy settings
-  IT_BASE_URL,                    // e.g. "https://smelltoimpress.it" or "https://smelltoimpress.co.uk/it"
-  IT_GOOGLE_PRODUCT_CATEGORY,     // optional
+  // Public Italy shop URL for product links
+  IT_PUBLIC_DOMAIN,          // e.g. "https://smelltoimpress.it" OR "https://smelltoimpress.co.uk/it"
+
+  // Feed controls
+  FEED_CACHE_SECONDS = "900",
+  ONLY_IN_STOCK = "true",
+
+  // Optional defaults
   BRAND_FALLBACK = "SmellToImpress",
-
-  // Recommended: only export in-stock items
-  IT_ONLY_IN_STOCK = "true",
-
-  // Optional: feed title/description
-  FEED_TITLE = "SmellToImpress Italy",
-  FEED_DESCRIPTION = "Google Merchant Center feed (IT)"
+  GOOGLE_PRODUCT_CATEGORY = "Health & Beauty > Personal Care > Cosmetics > Perfume & Cologne"
 } = process.env;
 
-function must(val, name) {
-  if (!val) throw new Error(`Missing required env var: ${name}`);
+function must(v, name) {
+  if (!v) throw new Error(`Missing env var: ${name}`);
 }
 
-function xmlEscape(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+function boolEnv(v, fallback = false) {
+  if (v == null) return fallback;
+  return String(v).toLowerCase() === "true";
 }
 
 function stripHtml(html) {
-  return String(html ?? "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return String(html ?? "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function toGoogleAvailability(availableForSale) {
-  return availableForSale ? "in stock" : "out of stock";
-}
-
-// Adjust if your Italian store uses a different structure
-function buildProductLink(baseUrl, handle, variantId) {
-  const url = new URL(`${baseUrl.replace(/\/$/, "")}/products/${handle}`);
-  if (variantId) url.searchParams.set("variant", variantId);
+function buildProductLink(baseUrl, handle, variantIdNumeric) {
+  const clean = baseUrl.replace(/\/$/, "");
+  const url = new URL(`${clean}/products/${handle}`);
+  if (variantIdNumeric) url.searchParams.set("variant", String(variantIdNumeric));
   return url.toString();
 }
 
-async function shopifyStorefrontGraphQL(query, variables = {}) {
-  must(SHOPIFY_STORE_DOMAIN, "SHOPIFY_STORE_DOMAIN");
-  must(SHOPIFY_STOREFRONT_TOKEN, "SHOPIFY_STOREFRONT_TOKEN");
+// ----------------------
+// Admin token (24h) cache
+// ----------------------
+let tokenCache = { token: null, expiresAtMs: 0 };
 
-  const res = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/api/2025-01/graphql.json`, {
+async function getAdminToken() {
+  must(SHOP_MYSHOPIFY_DOMAIN, "SHOP_MYSHOPIFY_DOMAIN");
+  must(SHOPIFY_CLIENT_ID, "SHOPIFY_CLIENT_ID");
+  must(SHOPIFY_CLIENT_SECRET, "SHOPIFY_CLIENT_SECRET");
+
+  const now = Date.now();
+  if (tokenCache.token && now < tokenCache.expiresAtMs) return tokenCache.token;
+
+  const url = `https://${SHOP_MYSHOPIFY_DOMAIN}/admin/oauth/access_token`;
+  const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
-    },
-    body: JSON.stringify({ query, variables })
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+      grant_type: "client_credentials"
+    })
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Shopify Storefront API error: ${res.status} ${res.statusText} ${text}`);
+    throw new Error(`Token error ${res.status}: ${text}`);
   }
 
   const data = await res.json();
-  if (data.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
-  return data.data;
+  if (!data.access_token) throw new Error("No access_token returned from Shopify");
+
+  // Tokens are ~24h; refresh earlier (23h)
+  tokenCache = {
+    token: data.access_token,
+    expiresAtMs: now + 23 * 60 * 60 * 1000
+  };
+
+  return tokenCache.token;
 }
 
-async function fetchAllProductsAndVariants() {
+async function adminGraphQL(query, variables = {}) {
+  const token = await getAdminToken();
+
+  const res = await fetch(`https://${SHOP_MYSHOPIFY_DOMAIN}/admin/api/2025-01/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token
+    },
+    body: JSON.stringify({ query, variables })
+  });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Admin GraphQL HTTP ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
+  if (json.errors?.length) throw new Error(`Admin GraphQL errors: ${JSON.stringify(json.errors).slice(0, 800)}`);
+  return json.data;
+}
+
+// ----------------------
+// Feed cache
+// ----------------------
+let feedCache = { xml: null, expiresAtMs: 0 };
+
+function availabilityFromQty(qty) {
+  return qty > 0 ? "in stock" : "out of stock";
+}
+
+function safeText(s) {
+  // xmlbuilder2 escapes automatically, but keep strings clean
+  return String(s ?? "").replace(/\u00A0/g, " ");
+}
+
+async function fetchAllProductsPaginated() {
+  // Pull enough for most stores; includes pagination for safety.
   const query = `
-    query FeedProducts($first: Int!) {
-      products(first: $first) {
+    query Products($first: Int!, $after: String) {
+      products(first: $first, after: $after) {
+        pageInfo { hasNextPage endCursor }
         edges {
           node {
             id
+            legacyResourceId
             handle
             title
             vendor
             descriptionHtml
             featuredImage { url }
             images(first: 1) { edges { node { url } } }
+
+            translations(locale: "it") {
+              key
+              value
+            }
+
             variants(first: 100) {
               edges {
                 node {
                   id
+                  legacyResourceId
                   title
                   sku
                   barcode
-                  availableForSale
-                  price { amount currencyCode }
+                  inventoryQuantity
+
+                  contextualPricing(context: {country: IT}) {
+                    price { amount currencyCode }
+                  }
                 }
               }
             }
           }
         }
       }
-      shop { name }
     }
   `;
-  const data = await shopifyStorefrontGraphQL(query, { first: 250 });
-  return {
-    shopName: data.shop?.name || "Shop",
-    products: data.products.edges.map(e => e.node)
-  };
+
+  let after = null;
+  const all = [];
+
+  while (true) {
+    const data = await adminGraphQL(query, { first: 100, after });
+    const conn = data.products;
+    for (const e of conn.edges) all.push(e.node);
+
+    if (!conn.pageInfo.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
+  }
+
+  return all;
 }
 
-function pickImageUrl(product) {
-  return product.featuredImage?.url || product.images?.edges?.[0]?.node?.url || "";
-}
-
-function buildRss({ baseUrl, items }) {
-  const now = new Date().toUTCString();
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
-<channel>
-  <title>${xmlEscape(FEED_TITLE)}</title>
-  <link>${xmlEscape(baseUrl)}</link>
-  <description>${xmlEscape(FEED_DESCRIPTION)}</description>
-  <language>it</language>
-  <pubDate>${xmlEscape(now)}</pubDate>
-${items.join("\n")}
-</channel>
-</rss>
-`;
+function getTranslation(translations, key) {
+  const t = (translations || []).find(x => x.key === key);
+  return t?.value || null;
 }
 
 app.get("/health", (_, res) => res.status(200).send("ok"));
 
-app.get("/feed/it.xml", async (_, res) => {
+app.get("/feed-it.xml", async (_, res) => {
   try {
-    must(IT_BASE_URL, "IT_BASE_URL");
+    must(IT_PUBLIC_DOMAIN, "IT_PUBLIC_DOMAIN");
 
-    const { shopName, products } = await fetchAllProductsAndVariants();
-    const onlyInStock = String(IT_ONLY_IN_STOCK).toLowerCase() === "true";
-    const baseUrl = IT_BASE_URL;
+    const now = Date.now();
+    const ttlMs = Number(FEED_CACHE_SECONDS) * 1000;
+    if (feedCache.xml && now < feedCache.expiresAtMs) {
+      res.setHeader("Content-Type", "application/rss+xml; charset=UTF-8");
+      res.setHeader("Cache-Control", `public, max-age=${Math.max(60, Number(FEED_CACHE_SECONDS))}`);
+      return res.status(200).send(feedCache.xml);
+    }
 
-    const items = [];
+    const onlyInStock = boolEnv(ONLY_IN_STOCK, true);
+    const products = await fetchAllProductsPaginated();
+
+    const doc = create({ version: "1.0", encoding: "UTF-8" })
+      .ele("rss", { version: "2.0", "xmlns:g": "http://base.google.com/ns/1.0" })
+      .ele("channel");
+
+    doc.ele("title").txt("SmellToImpress Italy").up();
+    doc.ele("link").txt(IT_PUBLIC_DOMAIN).up();
+    doc.ele("description").txt("Google Merchant Center feed (IT)").up();
+    doc.ele("language").txt("it").up();
 
     for (const p of products) {
-      const imageUrl = pickImageUrl(p);
-      const desc = stripHtml(p.descriptionHtml);
+      const img =
+        p.featuredImage?.url ||
+        p.images?.edges?.[0]?.node?.url ||
+        "";
+
+      // Prefer Italian translations when present
+      const titleIT = getTranslation(p.translations, "title") || p.title;
+      const bodyIT = getTranslation(p.translations, "body_html") || p.descriptionHtml;
+
+      const description = stripHtml(bodyIT) || stripHtml(p.descriptionHtml) || titleIT;
+
       const brand = p.vendor || BRAND_FALLBACK;
 
-      for (const vEdge of p.variants.edges || []) {
-        const v = vEdge.node;
+      for (const ve of (p.variants?.edges || [])) {
+        const v = ve.node;
 
-        if (onlyInStock && !v.availableForSale) continue;
+        const qty = Number(v.inventoryQuantity ?? 0);
+        if (onlyInStock && qty <= 0) continue;
 
-        const amount = v.price?.amount;
-        const currency = v.price?.currencyCode || "EUR";
-        if (!amount) continue;
+        const priceObj = v.contextualPricing?.price;
+        if (!priceObj?.amount) continue;
 
-        const link = buildProductLink(baseUrl, p.handle, v.id);
+        const currency = priceObj.currencyCode || "EUR";
+        const amount = priceObj.amount;
 
-        const title =
+        // Google id: prefer SKU, else numeric legacyResourceId
+        const gid = v.sku ? `SKU-${v.sku}` : `VAR-${v.legacyResourceId || v.id}`;
+
+        const variantTitle =
           v.title && v.title !== "Default Title"
-            ? `${p.title} - ${v.title}`
-            : p.title;
+            ? `${titleIT} - ${v.title}`
+            : titleIT;
 
-        const id = v.sku ? `SKU-${v.sku}` : `VAR-${v.id}`;
+        const link = buildProductLink(IT_PUBLIC_DOMAIN, p.handle, v.legacyResourceId);
 
-        const gcat = IT_GOOGLE_PRODUCT_CATEGORY
-          ? `<g:google_product_category>${xmlEscape(IT_GOOGLE_PRODUCT_CATEGORY)}</g:google_product_category>`
-          : "";
+        const item = doc.ele("item");
+        item.ele("g:id").txt(safeText(gid)).up();
+        item.ele("g:title").txt(safeText(variantTitle)).up();
+        item.ele("g:description").txt(safeText(description)).up();
+        item.ele("g:link").txt(safeText(link)).up();
+        item.ele("g:image_link").txt(safeText(img)).up();
+        item.ele("g:availability").txt(availabilityFromQty(qty)).up();
+        item.ele("g:price").txt(`${amount} ${currency}`).up();
+        item.ele("g:condition").txt("new").up();
+        item.ele("g:brand").txt(safeText(brand)).up();
+        item.ele("g:google_product_category").txt(safeText(GOOGLE_PRODUCT_CATEGORY)).up();
 
-        const gtin = v.barcode ? `<g:gtin>${xmlEscape(v.barcode)}</g:gtin>` : "";
+        // Identifiers
+        if (v.barcode) item.ele("g:gtin").txt(safeText(v.barcode)).up();
+        if (v.sku) item.ele("g:mpn").txt(safeText(v.sku)).up();
 
-        // If no barcode and no sku => tell Google identifiers don't exist
-        const identifierExists = (v.barcode || v.sku) ? "" : "<g:identifier_exists>false</g:identifier_exists>";
+        if (!v.barcode && !v.sku) item.ele("g:identifier_exists").txt("false").up();
 
-        items.push(`
-  <item>
-    <g:id>${xmlEscape(id)}</g:id>
-    <g:title>${xmlEscape(title)}</g:title>
-    <g:description>${xmlEscape(desc || p.title)}</g:description>
-    <g:link>${xmlEscape(link)}</g:link>
-    <g:image_link>${xmlEscape(imageUrl)}</g:image_link>
-    <g:availability>${xmlEscape(toGoogleAvailability(v.availableForSale))}</g:availability>
-    <g:price>${xmlEscape(`${amount} ${currency}`)}</g:price>
-    <g:brand>${xmlEscape(brand)}</g:brand>
-    ${v.sku ? `<g:mpn>${xmlEscape(v.sku)}</g:mpn>` : ""}
-    ${gtin}
-    ${identifierExists}
-    ${gcat}
-    <g:condition>new</g:condition>
-  </item>`.trim());
+        item.up();
       }
     }
 
-    // If FEED_TITLE wasn't set, fall back to shopName
-    if (!process.env.FEED_TITLE) process.env.FEED_TITLE = `${shopName} Italy`;
+    const xml = doc.end({ prettyPrint: true });
 
-    const xml = buildRss({ baseUrl, items });
+    feedCache = { xml, expiresAtMs: Date.now() + ttlMs };
 
     res.setHeader("Content-Type", "application/rss+xml; charset=UTF-8");
-    res.setHeader("Cache-Control", "public, max-age=900");
+    res.setHeader("Cache-Control", `public, max-age=${Math.max(60, Number(FEED_CACHE_SECONDS))}`);
     res.status(200).send(xml);
   } catch (err) {
-    res.status(500).json({ error: "Feed generation failed", message: err?.message || String(err) });
+    res.status(500).json({ error: "IT feed failed", message: err?.message || String(err) });
   }
 });
 
-app.listen(PORT, () => console.log(`GMC IT feed on :${PORT}`));
+app.listen(PORT, () => console.log(`GMC IT feed running on :${PORT}`));
