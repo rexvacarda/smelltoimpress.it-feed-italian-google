@@ -47,11 +47,35 @@ function xmlEscape(str) {
     .replace(/'/g, "&apos;");
 }
 
+function normalizeBaseUrl(input) {
+  const s = String(input || "").trim();
+  if (!s) return s;
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+  return `https://${s}`;
+}
+
 function buildProductLink(baseUrl, handle, variantIdNumeric) {
-  const clean = baseUrl.replace(/\/$/, "");
+  const clean = normalizeBaseUrl(baseUrl).replace(/\/$/, "");
   const url = new URL(`${clean}/products/${handle}`);
   if (variantIdNumeric) url.searchParams.set("variant", String(variantIdNumeric));
   return url.toString();
+}
+
+/**
+ * Google Merchant "id" must be reasonably short.
+ * Use Shopify numeric legacyResourceId first; cap SKU if used.
+ */
+function toShortGmcId(v) {
+  if (v?.legacyResourceId) return String(v.legacyResourceId);
+
+  const sku = String(v?.sku || "").trim();
+  if (sku) return sku.slice(0, 50); // keep stable, but safe length
+
+  // Extract digits from gid://shopify/ProductVariant/12345
+  const m = String(v?.id || "").match(/(\d+)\s*$/);
+  if (m) return m[1];
+
+  return "v";
 }
 
 // ----------------------
@@ -239,8 +263,8 @@ app.get("/feed-it.xml", async (_, res) => {
         const currency = priceObj.currencyCode || "EUR";
         const amount = priceObj.amount;
 
-        // Google id: prefer SKU, else numeric legacyResourceId
-        const gid = v.sku ? `SKU-${v.sku}` : `VAR-${v.legacyResourceId || v.id}`;
+        // ✅ SHORT Google id to avoid "Value too long in attribute: id"
+        const gid = toShortGmcId(v);
 
         const variantTitle =
           v.title && v.title !== "Default Title"
@@ -250,7 +274,7 @@ app.get("/feed-it.xml", async (_, res) => {
         const link = buildProductLink(IT_PUBLIC_DOMAIN, p.handle, v.legacyResourceId);
 
         const gtinXml = v.barcode ? `<g:gtin>${xmlEscape(v.barcode)}</g:gtin>` : "";
-        const mpnXml = v.sku ? `<g:mpn>${xmlEscape(v.sku)}</g:mpn>` : "";
+        const mpnXml = v.sku ? `<g:mpn>${xmlEscape(String(v.sku).slice(0, 70))}</g:mpn>` : "";
         const identifierExistsXml =
           (!v.barcode && !v.sku) ? `<g:identifier_exists>false</g:identifier_exists>` : "";
 
@@ -277,7 +301,7 @@ app.get("/feed-it.xml", async (_, res) => {
 <rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
 <channel>
   <title>${xmlEscape("SmellToImpress Italy")}</title>
-  <link>${xmlEscape(IT_PUBLIC_DOMAIN)}</link>
+  <link>${xmlEscape(normalizeBaseUrl(IT_PUBLIC_DOMAIN))}</link>
   <description>${xmlEscape("Google Merchant Center feed (IT)")}</description>
   <language>it</language>
   ${itemsXml}
