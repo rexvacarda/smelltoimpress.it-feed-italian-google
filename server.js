@@ -1,5 +1,4 @@
 import express from "express";
-import { create } from "xmlbuilder2";
 
 const app = express();
 
@@ -7,12 +6,12 @@ const {
   PORT = 3000,
 
   // Shopify (same style as your Zbozi/Glami guide)
-  SHOP_MYSHOPIFY_DOMAIN,     // e.g. "smelltoimpress.myshopify.com"
+  SHOP_MYSHOPIFY_DOMAIN, // e.g. "smelltoimpress.myshopify.com"
   SHOPIFY_CLIENT_ID,
   SHOPIFY_CLIENT_SECRET,
 
   // Public Italy shop URL for product links
-  IT_PUBLIC_DOMAIN,          // e.g. "https://smelltoimpress.it" OR "https://smelltoimpress.co.uk/it"
+  IT_PUBLIC_DOMAIN, // e.g. "https://smelltoimpress.it" OR "https://smelltoimpress.co.uk/it"
 
   // Feed controls
   FEED_CACHE_SECONDS = "900",
@@ -37,6 +36,15 @@ function stripHtml(html) {
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function xmlEscape(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 function buildProductLink(baseUrl, handle, variantIdNumeric) {
@@ -100,8 +108,12 @@ async function adminGraphQL(query, variables = {}) {
   });
 
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Admin GraphQL HTTP ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
-  if (json.errors?.length) throw new Error(`Admin GraphQL errors: ${JSON.stringify(json.errors).slice(0, 800)}`);
+  if (!res.ok) {
+    throw new Error(`Admin GraphQL HTTP ${res.status}: ${JSON.stringify(json).slice(0, 1000)}`);
+  }
+  if (json.errors?.length) {
+    throw new Error(`Admin GraphQL errors: ${JSON.stringify(json.errors).slice(0, 1500)}`);
+  }
   return json.data;
 }
 
@@ -114,13 +126,12 @@ function availabilityFromQty(qty) {
   return qty > 0 ? "in stock" : "out of stock";
 }
 
-function safeText(s) {
-  // xmlbuilder2 escapes automatically, but keep strings clean
-  return String(s ?? "").replace(/\u00A0/g, " ");
+function getTranslation(translations, key) {
+  const t = (translations || []).find((x) => x.key === key);
+  return t?.value || null;
 }
 
 async function fetchAllProductsPaginated() {
-  // Pull enough for most stores; includes pagination for safety.
   const query = `
     query Products($first: Int!, $after: String) {
       products(first: $first, after: $after) {
@@ -169,6 +180,7 @@ async function fetchAllProductsPaginated() {
   while (true) {
     const data = await adminGraphQL(query, { first: 100, after });
     const conn = data.products;
+
     for (const e of conn.edges) all.push(e.node);
 
     if (!conn.pageInfo.hasNextPage) break;
@@ -176,11 +188,6 @@ async function fetchAllProductsPaginated() {
   }
 
   return all;
-}
-
-function getTranslation(translations, key) {
-  const t = (translations || []).find(x => x.key === key);
-  return t?.value || null;
 }
 
 app.get("/health", (_, res) => res.status(200).send("ok"));
@@ -191,6 +198,7 @@ app.get("/feed-it.xml", async (_, res) => {
 
     const now = Date.now();
     const ttlMs = Number(FEED_CACHE_SECONDS) * 1000;
+
     if (feedCache.xml && now < feedCache.expiresAtMs) {
       res.setHeader("Content-Type", "application/rss+xml; charset=UTF-8");
       res.setHeader("Cache-Control", `public, max-age=${Math.max(60, Number(FEED_CACHE_SECONDS))}`);
@@ -200,14 +208,7 @@ app.get("/feed-it.xml", async (_, res) => {
     const onlyInStock = boolEnv(ONLY_IN_STOCK, true);
     const products = await fetchAllProductsPaginated();
 
-    const doc = create({ version: "1.0", encoding: "UTF-8" })
-      .ele("rss", { version: "2.0", "xmlns:g": "http://base.google.com/ns/1.0" })
-      .ele("channel");
-
-    doc.ele("title").txt("SmellToImpress Italy").up();
-    doc.ele("link").txt(IT_PUBLIC_DOMAIN).up();
-    doc.ele("description").txt("Google Merchant Center feed (IT)").up();
-    doc.ele("language").txt("it").up();
+    let itemsXml = "";
 
     for (const p of products) {
       const img =
@@ -219,7 +220,10 @@ app.get("/feed-it.xml", async (_, res) => {
       const titleIT = getTranslation(p.translations, "title") || p.title;
       const bodyIT = getTranslation(p.translations, "body_html") || p.descriptionHtml;
 
-      const description = stripHtml(bodyIT) || stripHtml(p.descriptionHtml) || titleIT;
+      const description =
+        stripHtml(bodyIT) ||
+        stripHtml(p.descriptionHtml) ||
+        titleIT;
 
       const brand = p.vendor || BRAND_FALLBACK;
 
@@ -245,29 +249,41 @@ app.get("/feed-it.xml", async (_, res) => {
 
         const link = buildProductLink(IT_PUBLIC_DOMAIN, p.handle, v.legacyResourceId);
 
-        const item = doc.ele("item");
-        item.ele("g:id").txt(safeText(gid)).up();
-        item.ele("g:title").txt(safeText(variantTitle)).up();
-        item.ele("g:description").txt(safeText(description)).up();
-        item.ele("g:link").txt(safeText(link)).up();
-        item.ele("g:image_link").txt(safeText(img)).up();
-        item.ele("g:availability").txt(availabilityFromQty(qty)).up();
-        item.ele("g:price").txt(`${amount} ${currency}`).up();
-        item.ele("g:condition").txt("new").up();
-        item.ele("g:brand").txt(safeText(brand)).up();
-        item.ele("g:google_product_category").txt(safeText(GOOGLE_PRODUCT_CATEGORY)).up();
+        const gtinXml = v.barcode ? `<g:gtin>${xmlEscape(v.barcode)}</g:gtin>` : "";
+        const mpnXml = v.sku ? `<g:mpn>${xmlEscape(v.sku)}</g:mpn>` : "";
+        const identifierExistsXml =
+          (!v.barcode && !v.sku) ? `<g:identifier_exists>false</g:identifier_exists>` : "";
 
-        // Identifiers
-        if (v.barcode) item.ele("g:gtin").txt(safeText(v.barcode)).up();
-        if (v.sku) item.ele("g:mpn").txt(safeText(v.sku)).up();
-
-        if (!v.barcode && !v.sku) item.ele("g:identifier_exists").txt("false").up();
-
-        item.up();
+        itemsXml += `
+  <item>
+    <g:id>${xmlEscape(gid)}</g:id>
+    <g:title>${xmlEscape(variantTitle)}</g:title>
+    <g:description>${xmlEscape(description)}</g:description>
+    <g:link>${xmlEscape(link)}</g:link>
+    <g:image_link>${xmlEscape(img)}</g:image_link>
+    <g:availability>${availabilityFromQty(qty)}</g:availability>
+    <g:price>${xmlEscape(`${amount} ${currency}`)}</g:price>
+    <g:condition>new</g:condition>
+    <g:brand>${xmlEscape(brand)}</g:brand>
+    <g:google_product_category>${xmlEscape(GOOGLE_PRODUCT_CATEGORY)}</g:google_product_category>
+    ${gtinXml}
+    ${mpnXml}
+    ${identifierExistsXml}
+  </item>`;
       }
     }
 
-    const xml = doc.end({ prettyPrint: true });
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+<channel>
+  <title>${xmlEscape("SmellToImpress Italy")}</title>
+  <link>${xmlEscape(IT_PUBLIC_DOMAIN)}</link>
+  <description>${xmlEscape("Google Merchant Center feed (IT)")}</description>
+  <language>it</language>
+  ${itemsXml}
+</channel>
+</rss>
+`;
 
     feedCache = { xml, expiresAtMs: Date.now() + ttlMs };
 
