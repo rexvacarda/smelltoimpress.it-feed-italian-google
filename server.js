@@ -273,10 +273,9 @@ app.get("/feed-it.xml", async (_, res) => {
 
         const link = buildProductLink(IT_PUBLIC_DOMAIN, p.handle, v.legacyResourceId);
 
-        const gtinXml = v.barcode ? `<g:gtin>${xmlEscape(v.barcode)}</g:gtin>` : "";
-        const mpnXml = v.sku ? `<g:mpn>${xmlEscape(String(v.sku).slice(0, 70))}</g:mpn>` : "";
-        const identifierExistsXml =
-          (!v.barcode && !v.sku) ? `<g:identifier_exists>false</g:identifier_exists>` : "";
+        const gtinXml = ""; 
+        const mpnXml = ""; 
+        const identifierExistsXml = `<g:identifier_exists>false</g:identifier_exists>`;
 
         itemsXml += `
   <item>
