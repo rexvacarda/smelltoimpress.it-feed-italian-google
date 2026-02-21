@@ -1,4 +1,3 @@
-import "dotenv/config";
 import express from "express";
 import { create } from "xmlbuilder2";
 
